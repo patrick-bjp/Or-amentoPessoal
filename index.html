@@ -104,6 +104,11 @@
   .rows .desc{min-width:0}
   .rows .desc .n{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .rows .desc .c{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);margin-top:2px}
+  .statuschip{display:inline-flex;align-items:center;gap:5px;margin-top:6px;font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;padding:4px 9px;border-radius:20px;border:1px solid;cursor:pointer;background:transparent;line-height:1}
+  .statuschip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+  .statuschip.pago{color:var(--green);border-color:var(--green)}
+  .statuschip.nao_pago{color:var(--red);border-color:var(--red-soft)}
+  .statuschip.parcial{color:var(--gold);border-color:var(--gold)}
   .rows .amt{font-family:'IBM Plex Mono',monospace;font-size:16px;font-weight:500;white-space:nowrap}
   .rows .del{width:34px;height:34px;border:none;background:var(--paper-2);color:var(--ink-soft);font-size:18px;border-radius:8px;cursor:pointer;line-height:1}
   .rows .del:active{background:var(--red);color:var(--paper)}
@@ -234,6 +239,10 @@
         <div class="bh"><span>Despesas / tipo</span><span id="bdExpenseTot" class="num">R$ 0,00</span></div>
         <div id="bdExpense"></div>
       </div>
+      <div class="bd-block">
+        <div class="bh"><span>Situação das despesas</span><span id="bdFalta" class="num neg">R$ 0,00</span></div>
+        <div id="bdStatus"></div>
+      </div>
     </div>
   </section>
 
@@ -292,6 +301,18 @@
       <div class="field">
         <label>Valor (R$)</label>
         <input class="val" name="valor" type="text" inputmode="decimal" placeholder="0,00" required>
+      </div>
+      <div class="field">
+        <label>Situação</label>
+        <select name="status" id="expStatus">
+          <option value="nao_pago" selected>Não pago</option>
+          <option value="pago">Pago</option>
+          <option value="parcial">Pago parcialmente</option>
+        </select>
+      </div>
+      <div class="field" id="fieldValorPago" style="display:none">
+        <label>Valor já pago (R$)</label>
+        <input class="val" name="valorPago" type="text" inputmode="decimal" placeholder="0,00">
       </div>
       <button type="submit">+ Lançar despesa</button>
     </form>
@@ -419,7 +440,10 @@ function mergeMonths(base,incoming){
     ['income','expense'].forEach(k=>{
       const map=new Map();
       ((base&&base[m]&&base[m][k])||[]).forEach(it=>map.set(it.id,it));
-      ((incoming&&incoming[m]&&incoming[m][k])||[]).forEach(it=>{if(!map.has(it.id))map.set(it.id,it);});
+      ((incoming&&incoming[m]&&incoming[m][k])||[]).forEach(it=>{
+        const cur=map.get(it.id);
+        if(!cur || (it.uAt||0) > (cur.uAt||0)) map.set(it.id,it); // versão mais recente vence
+      });
       out[m][k]=[...map.values()].filter(it=>!tombstones[it.id]);
     });
   });
@@ -446,6 +470,7 @@ async function api(path,method,body){
 // aplica uma operação sobre o objeto local (otimista)
 function applyOpLocal(op){
   if(op.type==='add'){const arr=bucket(op.month)[op.kind];if(!arr.some(x=>x.id===op.item.id))arr.push(op.item);}
+  else if(op.type==='update'){const arr=bucket(op.month)[op.kind];const it=arr.find(x=>x.id===op.id);if(it)Object.assign(it,op.patch);}
   else if(op.type==='del'){const b=bucket(op.month);b[op.kind]=b[op.kind].filter(x=>x.id!==op.id);tombstones[op.id]=Date.now();saveTombstones();}
   else if(op.type==='reset'){data={};tombstones={};saveTombstones();}
 }
@@ -506,8 +531,15 @@ function renderList(kind){
   items.forEach(it=>{
     const cat=kind==='income'?it.categoria:it.tipo;
     const nome=it.nome&&it.nome.trim()?it.nome:cat;
+    let chip='';
+    if(kind==='expense'){
+      const st=it.status||'nao_pago';
+      const lbl={pago:'pago',nao_pago:'não pago',parcial:'parcial'}[st];
+      const extra=(st==='parcial')?' · '+money(it.valorPago||0):'';
+      chip=`<button class="statuschip ${st}" data-id="${it.id}">${lbl}${extra}</button>`;
+    }
     const li=document.createElement('li');
-    li.innerHTML=`<div class="desc"><div class="n">${escapeHtml(nome)}</div><div class="c">${escapeHtml(cat)}</div></div>
+    li.innerHTML=`<div class="desc"><div class="n">${escapeHtml(nome)}</div><div class="c">${escapeHtml(cat)}</div>${chip}</div>
       <span class="amt ${kind==='income'?'pos':'neg'}">${kind==='income'?'':'−'}${money(it.valor)}</span>
       <button class="del" data-id="${it.id}" data-kind="${kind}">×</button>`;
     ul.appendChild(li);
@@ -565,7 +597,37 @@ function renderChart(){
   if(chart){chart.data=cfg.data;chart.update();}else chart=new Chart(document.getElementById('chart'),cfg);
 }
 
-function renderAll(){renderMonth();renderList('income');renderList('expense');renderBreakdown('income');renderBreakdown('expense');renderKPIs();renderChart();}
+function renderStatus(){
+  const items=bucket(current).expense;
+  const totalDesp=sum(items);
+  let pago=0; const cont={pago:0,parcial:0,nao_pago:0};
+  items.forEach(it=>{
+    const st=it.status||'nao_pago'; cont[st]++;
+    if(st==='pago') pago+=it.valor;
+    else if(st==='parcial') pago+=Math.min(it.valorPago||0,it.valor);
+  });
+  const falta=totalDesp-pago;
+  document.getElementById('bdFalta').textContent=money(falta);
+  const box=document.getElementById('bdStatus');box.innerHTML='';
+  if(!items.length){box.innerHTML='<div class="bd-empty">Sem despesas.</div>';return;}
+  const linhas=[
+    {lab:'Pago',cls:'g',val:pago,n:cont.pago},
+    {lab:'A pagar',cls:'r',val:falta,n:cont.nao_pago+cont.parcial}
+  ];
+  linhas.forEach(l=>{
+    const pct=totalDesp?Math.round(l.val/totalDesp*100):0;
+    const row=document.createElement('div');row.className='bd-row';
+    row.innerHTML=`<div class="bd-top"><span class="lab">${l.lab}</span><span class="amt">${money(l.val)} · ${pct}%</span></div>
+      <div class="bar-track"><div class="bar-fill ${l.cls}" style="width:${pct}%"></div></div>`;
+    box.appendChild(row);
+  });
+  const resumo=document.createElement('div');
+  resumo.style.cssText='font-family:\'IBM Plex Mono\',monospace;font-size:10.5px;color:var(--ink-soft);margin-top:4px';
+  resumo.textContent=`${cont.pago} pago(s) · ${cont.parcial} parcial(is) · ${cont.nao_pago} não pago(s)`;
+  box.appendChild(resumo);
+}
+
+function renderAll(){renderMonth();renderList('income');renderList('expense');renderBreakdown('income');renderBreakdown('expense');renderStatus();renderKPIs();renderChart();}
 
 /* ============ Navegação abas ============ */
 document.querySelectorAll('nav.tabs button[data-view]').forEach(btn=>{
@@ -582,22 +644,45 @@ document.querySelectorAll('nav.tabs button[data-view]').forEach(btn=>{
 document.getElementById('formIncome').addEventListener('submit',e=>{
   e.preventDefault();const f=e.target,valor=parseValor(f.valor.value);
   if(!valor){f.valor.focus();return;}
-  const item={id:uid(),categoria:f.categoria.value,nome:f.nome.value.trim(),valor};
+  const item={id:uid(),categoria:f.categoria.value,nome:f.nome.value.trim(),valor,uAt:Date.now()};
   commit({type:'add',kind:'income',month:current,item});
   f.reset();f.categoria.selectedIndex=0;
 });
 document.getElementById('formExpense').addEventListener('submit',e=>{
   e.preventDefault();const f=e.target,valor=parseValor(f.valor.value);
   if(!valor){f.valor.focus();return;}
-  const item={id:uid(),tipo:f.tipo.value,nome:f.nome.value.trim(),valor};
+  const status=f.status.value;
+  const item={id:uid(),tipo:f.tipo.value,nome:f.nome.value.trim(),valor,status,uAt:Date.now()};
+  if(status==='parcial') item.valorPago=parseValor(f.valorPago.value);
   commit({type:'add',kind:'expense',month:current,item});
-  f.reset();f.tipo.selectedIndex=0;
+  f.reset();f.tipo.selectedIndex=0;document.getElementById('fieldValorPago').style.display='none';
+});
+// mostra "valor já pago" só quando situação = parcial
+document.getElementById('expStatus').addEventListener('change',e=>{
+  document.getElementById('fieldValorPago').style.display = e.target.value==='parcial' ? '' : 'none';
 });
 document.addEventListener('click',e=>{
+  const chip=e.target.closest('.statuschip');
+  if(chip){ cycleStatus(current,chip.dataset.id); return; }
   const del=e.target.closest('.del');if(!del)return;
-  const{id,kind}=del.dataset;
-  commit({type:'del',kind,month:current,id});
+  commit({type:'del',kind:del.dataset.kind,month:current,id:del.dataset.id});
 });
+
+// alterna a situação de pagamento de uma despesa: não pago → pago → parcial → …
+function cycleStatus(month,id){
+  const it=bucket(month).expense.find(x=>x.id===id);if(!it)return;
+  const next={nao_pago:'pago',pago:'parcial',parcial:'nao_pago'}[it.status||'nao_pago'];
+  const patch={status:next,uAt:Date.now()};
+  if(next==='parcial'){
+    const atual=it.valorPago?String(it.valorPago).replace('.',','):'';
+    const v=prompt('Quanto já foi pago desta despesa? (R$)',atual);
+    if(v===null) return; // cancelou
+    patch.valorPago=parseValor(v);
+  }else{
+    patch.valorPago=0;
+  }
+  commit({type:'update',kind:'expense',month,id,patch});
+}
 
 /* ============ Mês ============ */
 function goto(off){const idx=MONTHS.findIndex(m=>m.key===current);current=MONTHS[Math.min(MONTHS.length-1,Math.max(0,idx+off))].key;renderAll();}
@@ -668,15 +753,19 @@ const stamp=()=>new Date().toISOString().slice(0,10);
 
 function exportXlsx(){
   const meses=mesesComDados();if(!meses.length){toast('Nada para exportar');return;}
-  const rows=[['Mês','Movimento','Categoria/Tipo','Nome/Descrição','Valor (R$)']];
+  const SL={pago:'Pago',nao_pago:'Não pago',parcial:'Parcial'};
+  const rows=[['Mês','Movimento','Categoria/Tipo','Nome/Descrição','Valor (R$)','Situação','Valor pago (R$)']];
   meses.forEach(mo=>{const b=data[mo.key],mn=capMonth(mo.key);
-    b.income.forEach(it=>rows.push([mn,'Provento',it.categoria,it.nome||'',it.valor]));
-    b.expense.forEach(it=>rows.push([mn,'Despesa',it.tipo,it.nome||'',it.valor]));});
-  const wsL=XLSX.utils.aoa_to_sheet(rows);wsL['!cols']=[{wch:16},{wch:12},{wch:22},{wch:28},{wch:14}];
-  const res=[['Mês','Proventos','Despesas','Saldo','Saldo acumulado']];let acum=0,tI=0,tE=0;
-  meses.forEach(mo=>{const b=data[mo.key],inc=sum(b.income),exp=sum(b.expense),sal=inc-exp;acum+=sal;tI+=inc;tE+=exp;res.push([capMonth(mo.key),inc,exp,sal,acum]);});
-  res.push(['TOTAL',tI,tE,tI-tE,'']);
-  const wsR=XLSX.utils.aoa_to_sheet(res);wsR['!cols']=[{wch:16},{wch:14},{wch:14},{wch:14},{wch:16}];
+    b.income.forEach(it=>rows.push([mn,'Provento',it.categoria,it.nome||'',it.valor,'','']));
+    b.expense.forEach(it=>{const st=it.status||'nao_pago';const pg=st==='pago'?it.valor:(st==='parcial'?(it.valorPago||0):0);rows.push([mn,'Despesa',it.tipo,it.nome||'',it.valor,SL[st],pg]);});});
+  const wsL=XLSX.utils.aoa_to_sheet(rows);wsL['!cols']=[{wch:16},{wch:12},{wch:22},{wch:26},{wch:14},{wch:12},{wch:14}];
+  const res=[['Mês','Proventos','Despesas','Saldo','Saldo acumulado','A pagar']];let acum=0,tI=0,tE=0,tF=0;
+  meses.forEach(mo=>{const b=data[mo.key],inc=sum(b.income),exp=sum(b.expense),sal=inc-exp;acum+=sal;tI+=inc;tE+=exp;
+    let pg=0;b.expense.forEach(it=>{const st=it.status||'nao_pago';pg+=st==='pago'?it.valor:(st==='parcial'?Math.min(it.valorPago||0,it.valor):0);});
+    const falta=exp-pg;tF+=falta;
+    res.push([capMonth(mo.key),inc,exp,sal,acum,falta]);});
+  res.push(['TOTAL',tI,tE,tI-tE,'',tF]);
+  const wsR=XLSX.utils.aoa_to_sheet(res);wsR['!cols']=[{wch:16},{wch:14},{wch:14},{wch:14},{wch:16},{wch:14}];
   const wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,wsR,'Resumo Mensal');
   XLSX.utils.book_append_sheet(wb,wsL,'Lançamentos');
@@ -705,18 +794,21 @@ function exportPdf(){
   meses.forEach(mo=>{const b=data[mo.key];doc.addPage();
     doc.setFont('helvetica','bold');doc.setFontSize(15);doc.setTextColor(...ink);doc.text(capMonth(mo.key),40,52);
     const inc=sum(b.income),exp=sum(b.expense),sal=inc-exp;doc.setFontSize(9);doc.setFont('helvetica','normal');
+    let pg=0;b.expense.forEach(it=>{const st=it.status||'nao_pago';pg+=st==='pago'?it.valor:(st==='parcial'?Math.min(it.valorPago||0,it.valor):0);});
+    const falta=exp-pg;
     doc.setTextColor(...green);doc.text(`Proventos: ${money(inc)}`,40,70);
-    doc.setTextColor(...red);doc.text(`Despesas: ${money(exp)}`,200,70);
-    doc.setTextColor(sal>=0?green[0]:red[0],sal>=0?green[1]:red[1],sal>=0?green[2]:red[2]);doc.text(`Saldo: ${money(sal)}`,350,70);
+    doc.setTextColor(...red);doc.text(`Despesas: ${money(exp)}`,175,70);
+    doc.setTextColor(sal>=0?green[0]:red[0],sal>=0?green[1]:red[1],sal>=0?green[2]:red[2]);doc.text(`Saldo: ${money(sal)}`,310,70);
+    doc.setTextColor(...soft);doc.text(`A pagar: ${money(falta)}`,420,70);
     let y=86;
     if(b.income.length){doc.autoTable({startY:y,head:[['Provento — Categoria','Nome','Valor']],
       body:b.income.map(it=>[it.categoria,it.nome||'—',money(it.valor)]),theme:'striped',
       headStyles:{fillColor:green,textColor:[244,240,230],fontSize:9},bodyStyles:{fontSize:9,textColor:ink},
       columnStyles:{2:{halign:'right',cellWidth:90}},margin:{left:40,right:40}});y=doc.lastAutoTable.finalY+16;}
-    if(b.expense.length){doc.autoTable({startY:y,head:[['Despesa — Tipo','Descrição','Valor']],
-      body:b.expense.map(it=>[it.tipo,it.nome||'—',money(it.valor)]),theme:'striped',
+    if(b.expense.length){doc.autoTable({startY:y,head:[['Despesa — Tipo','Descrição','Situação','Valor']],
+      body:b.expense.map(it=>{const st=it.status||'nao_pago';const SL={pago:'Pago',nao_pago:'Não pago',parcial:'Parcial ('+money(it.valorPago||0)+')'};return [it.tipo,it.nome||'—',SL[st],money(it.valor)];}),theme:'striped',
       headStyles:{fillColor:red,textColor:[244,240,230],fontSize:9},bodyStyles:{fontSize:9,textColor:ink},
-      columnStyles:{2:{halign:'right',cellWidth:90}},margin:{left:40,right:40}});}
+      columnStyles:{3:{halign:'right',cellWidth:80}},margin:{left:40,right:40}});}
   });
   const total=doc.internal.getNumberOfPages();
   for(let i=1;i<=total;i++){doc.setPage(i);doc.setFontSize(8);doc.setTextColor(...soft);
