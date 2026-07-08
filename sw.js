@@ -1,7 +1,7 @@
 // Service Worker — Orçamento Pessoal
 // Estratégia: cache-first para os assets do app; as libs de CDN são
 // cacheadas na primeira visita online e depois servidas offline.
-const CACHE = 'orcamento-v1';
+const CACHE = 'orcamento-v2';
 
 const CORE = [
   './',

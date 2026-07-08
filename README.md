@@ -1,8 +1,8 @@
 # Orçamento Pessoal — PWA
 
 App de orçamento (proventos × despesas) instalável no celular, com painel,
-exportação Excel/PDF e funcionamento offline. Uso individual, dados salvos
-no próprio aparelho (`localStorage`).
+exportação Excel/PDF e funcionamento offline. Sincronização opcional entre
+aparelhos via Cloudflare Worker + KV (pasta `worker/`).
 
 ## Arquivos
 
@@ -34,9 +34,11 @@ no próprio aparelho (`localStorage`).
 
 ## Observações
 
-- **Onde os dados ficam:** no navegador de cada aparelho (`localStorage`).
-  Não sincroniza entre celulares ainda e some se você limpar os dados do site.
+- **Onde os dados ficam:** por padrão, no navegador de cada aparelho
+  (`localStorage`) — uso individual. Para você e a Jessica compartilharem os
+  mesmos dados, ligue a **Sincronização** (toque no indicador no topo do app) e
+  publique o Worker: veja `worker/README.md`.
 - **Offline:** depois da primeira abertura online, o app abre sem internet.
-  As exportações Excel/PDF dependem de bibliotecas de CDN — ficam disponíveis
-  offline após a primeira visita, quando o service worker as cacheia.
+  Com sincronização ligada, lançamentos feitos offline entram numa fila e sobem
+  quando a conexão volta.
 - **Meses:** julho/2026 a dezembro/2027.

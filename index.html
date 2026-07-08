@@ -50,7 +50,12 @@
   .brand{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
   .brand .t{font-family:'Fraunces',serif;font-weight:600;font-size:21px;letter-spacing:-.01em}
   .brand .t em{font-style:italic;color:var(--gold)}
-  .brand .badge{font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-soft);border:1px solid var(--line);padding:4px 8px;border-radius:20px}
+  .syncbtn{display:flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--line);color:var(--ink-soft);
+    font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.04em;padding:6px 10px;border-radius:20px;cursor:pointer}
+  .syncbtn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2}
+  .syncdot{width:8px;height:8px;border-radius:50%;background:var(--line);flex:none;transition:.3s}
+  .syncdot.on{background:var(--green)} .syncdot.off{background:var(--red)} .syncdot.busy{background:var(--gold);animation:pulse 1s infinite}
+  @keyframes pulse{50%{opacity:.35}}
 
   .monthbar{display:flex;align-items:center;justify-content:space-between;gap:10px}
   .monthnav{display:flex;align-items:center;gap:8px;flex:1}
@@ -163,6 +168,14 @@
   .sheet .exp-btn .tx span{font-size:12px;color:var(--ink-soft)}
   .sheet .danger{width:100%;background:none;border:1px solid var(--line);color:var(--ink-soft);border-radius:10px;padding:13px;font-family:'IBM Plex Mono',monospace;font-size:12px;cursor:pointer;margin-top:6px}
   .sheet .danger:active{border-color:var(--red);color:var(--red)}
+  .sheet .field{display:flex;flex-direction:column;gap:5px;margin-bottom:13px}
+  .sheet .field label{font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft)}
+  .sheet .field input{font-family:'Hanken Grotesk',sans-serif;font-size:16px;padding:13px 12px;border:1.5px solid var(--line);background:var(--card);color:var(--ink);border-radius:9px;width:100%}
+  .sheet .field input:focus{outline:none;border-color:var(--ink)}
+  .sheet .connect{width:100%;background:var(--green);color:var(--paper);border:none;border-radius:11px;padding:15px;font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;cursor:pointer;margin-bottom:10px}
+  .sheet .connect:active{background:var(--green-soft)}
+  .sheet .synchint{font-size:12px;margin-top:14px;margin-bottom:0;min-height:16px}
+  .sheet .synchint.ok{color:var(--green)} .sheet .synchint.err{color:var(--red)}
 
   /* toast */
   #toast{position:fixed;left:50%;bottom:calc(var(--nav-h) + var(--sab) + 16px);transform:translateX(-50%) translateY(20px);
@@ -177,7 +190,11 @@
 <header>
   <div class="brand">
     <div class="t">Orçamento <em>Pessoal</em></div>
-    <div class="badge">Patrick &amp; Jessica</div>
+    <button class="syncbtn" id="syncBtn" title="Sincronização">
+      <span class="syncdot" id="syncDot"></span>
+      <span id="syncTxt">só neste aparelho</span>
+      <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 14-5m2-3v5h-5M20 12a8 8 0 0 1-14 5m-2 3v-5h5"/></svg>
+    </button>
   </div>
   <div class="monthbar">
     <div class="monthnav">
@@ -319,6 +336,25 @@
   <button class="danger" id="resetBtn">Limpar todos os dados</button>
 </div>
 
+<!-- ===== Sheet de sincronização ===== -->
+<div class="sheet-backdrop" id="syncBackdrop"></div>
+<div class="sheet" id="syncSheet">
+  <div class="grab"></div>
+  <h3>Sincronização</h3>
+  <p>Conecte os dois celulares ao mesmo orçamento. Preencha o endereço do Worker e a senha compartilhada — os mesmos nos dois aparelhos.</p>
+  <div class="field">
+    <label>Endereço do Worker</label>
+    <input id="syncUrl" type="url" inputmode="url" placeholder="https://orcamento-sync.SEU-USUARIO.workers.dev" autocomplete="off" autocapitalize="off" spellcheck="false">
+  </div>
+  <div class="field">
+    <label>Senha compartilhada</label>
+    <input id="syncToken" type="password" placeholder="a mesma nos dois celulares" autocomplete="off">
+  </div>
+  <button class="connect" id="syncConnect">Conectar e sincronizar</button>
+  <button class="danger" id="syncDisconnect">Desconectar deste aparelho</button>
+  <p class="synchint" id="syncHint"></p>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -351,9 +387,86 @@ const capMonth=key=>monthName(key).replace(/^\w/,c=>c.toUpperCase());
 
 /* ============ Estado ============ */
 let data={},current=MONTHS[0].key,chart=null;
-function load(){const r=store.get(KEY);try{data=r?JSON.parse(r):{};}catch(e){data={};}if(typeof data!=='object'||!data)data={};}
-function save(){store.set(KEY,JSON.stringify(data));toast('✓ salvo');}
+function loadLocal(){const r=store.get(KEY);try{data=r?JSON.parse(r):{};}catch(e){data={};}if(typeof data!=='object'||!data)data={};}
+function cacheLocal(){store.set(KEY,JSON.stringify(data));}
 function bucket(k){if(!data[k])data[k]={income:[],expense:[]};return data[k];}
+
+/* ============ Sincronização (Cloudflare Worker + KV) ============ */
+const SYNC_CFG='orcamento-sync-cfg';   // {url, token}
+const QUEUE_KEY='orcamento-op-queue';  // operações pendentes (offline)
+let sync={url:'',token:'',on:false};
+let queue=[];
+
+function loadSyncCfg(){
+  try{const c=JSON.parse(store.get(SYNC_CFG)||'null');if(c&&c.url&&c.token){sync={url:c.url.replace(/\/+$/,''),token:c.token,on:true};}}catch(e){}
+  try{queue=JSON.parse(store.get(QUEUE_KEY)||'[]');}catch(e){queue=[];}
+}
+function saveQueue(){store.set(QUEUE_KEY,JSON.stringify(queue));}
+
+function setSyncUI(state){ // 'on' | 'off' | 'busy' | 'local'
+  const dot=document.getElementById('syncDot'),txt=document.getElementById('syncTxt');
+  dot.className='syncdot '+(state==='local'?'':state);
+  txt.textContent={on:'sincronizado',off:'offline',busy:'sincronizando…',local:'só neste aparelho'}[state];
+}
+
+async function api(path,method,body){
+  const res=await fetch(sync.url+path,{
+    method,
+    headers:{'Content-Type':'application/json','X-Auth-Token':sync.token},
+    body:body?JSON.stringify(body):undefined
+  });
+  if(res.status===401) throw new Error('senha incorreta');
+  if(!res.ok) throw new Error('HTTP '+res.status);
+  return res.json();
+}
+
+// aplica uma operação sobre o objeto local (otimista)
+function applyOpLocal(op){
+  if(op.type==='add'){const arr=bucket(op.month)[op.kind];if(!arr.some(x=>x.id===op.item.id))arr.push(op.item);}
+  else if(op.type==='del'){const b=bucket(op.month);b[op.kind]=b[op.kind].filter(x=>x.id!==op.id);}
+  else if(op.type==='reset'){data={};}
+}
+
+// registra uma mudança: aplica local, cacheia, renderiza e (se sync) enfileira+envia
+function commit(op){
+  applyOpLocal(op);
+  cacheLocal();
+  renderAll();
+  if(sync.on){ queue.push(op); saveQueue(); flushQueue(); }
+  else toast('✓ salvo');
+}
+
+let flushing=false;
+async function flushQueue(){
+  if(!sync.on||flushing)return;
+  flushing=true; setSyncUI('busy');
+  try{
+    while(queue.length){
+      const op=queue[0];
+      const server=await api('/op','POST',op);
+      queue.shift(); saveQueue();
+      data=server.months||{}; // servidor é a fonte da verdade
+    }
+    // reconcilia com mudanças remotas (ex.: lançamentos da Jessica)
+    const server=await api('/data','GET');
+    data=server.months||{};
+    cacheLocal(); renderAll(); setSyncUI('on');
+  }catch(e){
+    setSyncUI('off');
+    if(String(e.message).includes('senha')) toast('Senha incorreta');
+  }finally{ flushing=false; }
+}
+
+async function pull(){
+  if(!sync.on)return;
+  // se há ops pendentes, envia-as primeiro (que já faz o pull no fim)
+  if(queue.length){ return flushQueue(); }
+  setSyncUI('busy');
+  try{
+    const server=await api('/data','GET');
+    data=server.months||{}; cacheLocal(); renderAll(); setSyncUI('on');
+  }catch(e){ setSyncUI('off'); }
+}
 
 /* toast */
 let toastT;
@@ -446,19 +559,21 @@ document.querySelectorAll('nav.tabs button[data-view]').forEach(btn=>{
 document.getElementById('formIncome').addEventListener('submit',e=>{
   e.preventDefault();const f=e.target,valor=parseValor(f.valor.value);
   if(!valor){f.valor.focus();return;}
-  bucket(current).income.push({id:uid(),categoria:f.categoria.value,nome:f.nome.value.trim(),valor});
-  f.reset();f.categoria.selectedIndex=0;save();renderAll();
+  const item={id:uid(),categoria:f.categoria.value,nome:f.nome.value.trim(),valor};
+  commit({type:'add',kind:'income',month:current,item});
+  f.reset();f.categoria.selectedIndex=0;
 });
 document.getElementById('formExpense').addEventListener('submit',e=>{
   e.preventDefault();const f=e.target,valor=parseValor(f.valor.value);
   if(!valor){f.valor.focus();return;}
-  bucket(current).expense.push({id:uid(),tipo:f.tipo.value,nome:f.nome.value.trim(),valor});
-  f.reset();f.tipo.selectedIndex=0;save();renderAll();
+  const item={id:uid(),tipo:f.tipo.value,nome:f.nome.value.trim(),valor};
+  commit({type:'add',kind:'expense',month:current,item});
+  f.reset();f.tipo.selectedIndex=0;
 });
 document.addEventListener('click',e=>{
   const del=e.target.closest('.del');if(!del)return;
-  const{id,kind}=del.dataset,b=bucket(current);
-  b[kind]=b[kind].filter(x=>x.id!==id);save();renderAll();
+  const{id,kind}=del.dataset;
+  commit({type:'del',kind,month:current,id});
 });
 
 /* ============ Mês ============ */
@@ -472,6 +587,55 @@ function openSheet(){sheet.classList.add('open');backdrop.classList.add('open');
 function closeSheet(){sheet.classList.remove('open');backdrop.classList.remove('open');}
 document.querySelector('nav.tabs button[data-sheet]').onclick=openSheet;
 backdrop.onclick=closeSheet;
+
+/* ============ Sheet sincronização ============ */
+const syncSheetEl=document.getElementById('syncSheet'),syncBackdrop=document.getElementById('syncBackdrop');
+function openSyncSheet(){
+  document.getElementById('syncUrl').value=sync.url||'';
+  document.getElementById('syncToken').value=sync.token||'';
+  document.getElementById('syncHint').textContent='';document.getElementById('syncHint').className='synchint';
+  syncSheetEl.classList.add('open');syncBackdrop.classList.add('open');
+}
+function closeSyncSheet(){syncSheetEl.classList.remove('open');syncBackdrop.classList.remove('open');}
+document.getElementById('syncBtn').onclick=openSyncSheet;
+syncBackdrop.onclick=closeSyncSheet;
+
+document.getElementById('syncConnect').onclick=async()=>{
+  const url=document.getElementById('syncUrl').value.trim().replace(/\/+$/,'');
+  const token=document.getElementById('syncToken').value.trim();
+  const hint=document.getElementById('syncHint');
+  if(!url||!token){hint.className='synchint err';hint.textContent='Preencha endereço e senha.';return;}
+  hint.className='synchint';hint.textContent='Conectando…';
+  const prev={...sync}; sync={url,token,on:true};
+  try{
+    // 1) envia o que já existe localmente (primeira conexão) e puxa o consolidado
+    const server=await api('/data','GET');
+    const remote=server.months||{};
+    // se este aparelho tem lançamentos locais que ainda não estão no servidor, sobe-os
+    const localItems=[];
+    Object.keys(data).forEach(m=>{['income','expense'].forEach(k=>{(data[m]?.[k]||[]).forEach(it=>{
+      const exists=(remote[m]?.[k]||[]).some(x=>x.id===it.id);
+      if(!exists) localItems.push({type:'add',kind:k,month:m,item:it});
+    });});});
+    for(const op of localItems){const s=await api('/op','POST',op);data=s.months||{};}
+    const finalServer=await api('/data','GET');
+    data=finalServer.months||{};
+    store.set(SYNC_CFG,JSON.stringify({url,token}));
+    cacheLocal();renderAll();setSyncUI('on');
+    hint.className='synchint ok';hint.textContent='✓ Conectado. Use a mesma senha no outro celular.';
+    setTimeout(closeSyncSheet,1200);
+  }catch(e){
+    sync=prev; setSyncUI(sync.on?'on':'local');
+    hint.className='synchint err';
+    hint.textContent=String(e.message).includes('senha')?'Senha incorreta.':'Não conectou. Confira o endereço e a internet.';
+  }
+};
+document.getElementById('syncDisconnect').onclick=()=>{
+  sync={url:'',token:'',on:false};queue=[];
+  store.del(SYNC_CFG);store.del(QUEUE_KEY);
+  setSyncUI('local');closeSyncSheet();
+  toast('Sincronização desligada');
+};
 
 /* ============ Exportação ============ */
 function mesesComDados(){return MONTHS.filter(mo=>{const b=data[mo.key];return b&&(b.income.length||b.expense.length);});}
@@ -538,8 +702,13 @@ function exportPdf(){
 document.getElementById('exportXlsx').onclick=exportXlsx;
 document.getElementById('exportPdf').onclick=exportPdf;
 document.getElementById('resetBtn').onclick=()=>{
-  if(confirm('Isto apagará TODOS os lançamentos de todos os meses. Continuar?')){
-    data={};current=MONTHS[0].key;store.del(KEY);closeSheet();renderAll();toast('Dados limpos');}
+  const aviso=sync.on?'Isto apagará TODOS os lançamentos de AMBOS os aparelhos (dados no servidor). Continuar?'
+                     :'Isto apagará TODOS os lançamentos de todos os meses. Continuar?';
+  if(confirm(aviso)){
+    current=MONTHS[0].key;
+    commit({type:'reset'});
+    closeSheet();toast('Dados limpos');
+  }
 };
 
 /* ============ Service Worker ============ */
@@ -548,7 +717,14 @@ if('serviceWorker' in navigator){
 }
 
 /* ============ Init ============ */
-load();renderAll();
+loadSyncCfg();
+loadLocal();
+setSyncUI(sync.on?'on':'local');
+renderAll();
+if(sync.on) pull();               // ao abrir, busca o estado compartilhado
+// re-sincroniza ao voltar para o app e ao reconectar à internet
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden&&sync.on) pull(); });
+window.addEventListener('online',()=>{ if(sync.on) flushQueue(); });
 </script>
 </body>
 </html>
