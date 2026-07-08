@@ -394,14 +394,37 @@ function bucket(k){if(!data[k])data[k]={income:[],expense:[]};return data[k];}
 /* ============ Sincronização (Cloudflare Worker + KV) ============ */
 const SYNC_CFG='orcamento-sync-cfg';   // {url, token}
 const QUEUE_KEY='orcamento-op-queue';  // operações pendentes (offline)
+const TOMB_KEY='orcamento-tombstones'; // exclusões recentes {id:ts}
 let sync={url:'',token:'',on:false};
 let queue=[];
+let tombstones={};
 
 function loadSyncCfg(){
   try{const c=JSON.parse(store.get(SYNC_CFG)||'null');if(c&&c.url&&c.token){sync={url:c.url.replace(/\/+$/,''),token:c.token,on:true};}}catch(e){}
   try{queue=JSON.parse(store.get(QUEUE_KEY)||'[]');}catch(e){queue=[];}
+  try{tombstones=JSON.parse(store.get(TOMB_KEY)||'{}');}catch(e){tombstones={};}
 }
 function saveQueue(){store.set(QUEUE_KEY,JSON.stringify(queue));}
+function saveTombstones(){store.set(TOMB_KEY,JSON.stringify(tombstones));}
+function pruneTombstones(){const cut=Date.now()-600000;let ch=false;for(const id in tombstones){if(tombstones[id]<cut){delete tombstones[id];ch=true;}}if(ch)saveTombstones();}
+function absorbTombstones(sv){if(sv&&sv.deleted){for(const id in sv.deleted)tombstones[id]=Math.max(tombstones[id]||0,sv.deleted[id]);saveTombstones();}}
+
+// une o estado local com o do servidor SEM perder lançamentos (união por id),
+// aplicando as exclusões conhecidas — resolve a defasagem eventual do KV.
+function mergeMonths(base,incoming){
+  const out={};
+  const ms=new Set([...Object.keys(base||{}),...Object.keys(incoming||{})]);
+  ms.forEach(m=>{
+    out[m]={income:[],expense:[]};
+    ['income','expense'].forEach(k=>{
+      const map=new Map();
+      ((base&&base[m]&&base[m][k])||[]).forEach(it=>map.set(it.id,it));
+      ((incoming&&incoming[m]&&incoming[m][k])||[]).forEach(it=>{if(!map.has(it.id))map.set(it.id,it);});
+      out[m][k]=[...map.values()].filter(it=>!tombstones[it.id]);
+    });
+  });
+  return out;
+}
 
 function setSyncUI(state){ // 'on' | 'off' | 'busy' | 'local'
   const dot=document.getElementById('syncDot'),txt=document.getElementById('syncTxt');
@@ -411,7 +434,7 @@ function setSyncUI(state){ // 'on' | 'off' | 'busy' | 'local'
 
 async function api(path,method,body){
   const res=await fetch(sync.url+path,{
-    method,
+    method,cache:'no-store',
     headers:{'Content-Type':'application/json','X-Auth-Token':sync.token},
     body:body?JSON.stringify(body):undefined
   });
@@ -423,8 +446,8 @@ async function api(path,method,body){
 // aplica uma operação sobre o objeto local (otimista)
 function applyOpLocal(op){
   if(op.type==='add'){const arr=bucket(op.month)[op.kind];if(!arr.some(x=>x.id===op.item.id))arr.push(op.item);}
-  else if(op.type==='del'){const b=bucket(op.month);b[op.kind]=b[op.kind].filter(x=>x.id!==op.id);}
-  else if(op.type==='reset'){data={};}
+  else if(op.type==='del'){const b=bucket(op.month);b[op.kind]=b[op.kind].filter(x=>x.id!==op.id);tombstones[op.id]=Date.now();saveTombstones();}
+  else if(op.type==='reset'){data={};tombstones={};saveTombstones();}
 }
 
 // registra uma mudança: aplica local, cacheia, renderiza e (se sync) enfileira+envia
@@ -441,16 +464,14 @@ async function flushQueue(){
   if(!sync.on||flushing)return;
   flushing=true; setSyncUI('busy');
   try{
+    let last=null;
     while(queue.length){
       const op=queue[0];
-      const server=await api('/op','POST',op);
+      last=await api('/op','POST',op); // resposta já traz o estado gravado (autoritativo)
       queue.shift(); saveQueue();
-      data=server.months||{}; // servidor é a fonte da verdade
     }
-    // reconcilia com mudanças remotas (ex.: lançamentos da Jessica)
-    const server=await api('/data','GET');
-    data=server.months||{};
-    cacheLocal(); renderAll(); setSyncUI('on');
+    if(last){ absorbTombstones(last); data=mergeMonths(data,last.months||{}); }
+    pruneTombstones(); cacheLocal(); renderAll(); setSyncUI('on');
   }catch(e){
     setSyncUI('off');
     if(String(e.message).includes('senha')) toast('Senha incorreta');
@@ -459,12 +480,14 @@ async function flushQueue(){
 
 async function pull(){
   if(!sync.on)return;
-  // se há ops pendentes, envia-as primeiro (que já faz o pull no fim)
+  // se há ops pendentes, envia-as primeiro
   if(queue.length){ return flushQueue(); }
   setSyncUI('busy');
   try{
-    const server=await api('/data','GET');
-    data=server.months||{}; cacheLocal(); renderAll(); setSyncUI('on');
+    const sv=await api('/data','GET');
+    absorbTombstones(sv);
+    data=mergeMonths(data,sv.months||{}); // une, nunca apaga o que é local
+    pruneTombstones(); cacheLocal(); renderAll(); setSyncUI('on');
   }catch(e){ setSyncUI('off'); }
 }
 
@@ -608,20 +631,22 @@ document.getElementById('syncConnect').onclick=async()=>{
   hint.className='synchint';hint.textContent='Conectando…';
   const prev={...sync}; sync={url,token,on:true};
   try{
-    // 1) envia o que já existe localmente (primeira conexão) e puxa o consolidado
-    const server=await api('/data','GET');
-    const remote=server.months||{};
-    // se este aparelho tem lançamentos locais que ainda não estão no servidor, sobe-os
-    const localItems=[];
-    Object.keys(data).forEach(m=>{['income','expense'].forEach(k=>{(data[m]?.[k]||[]).forEach(it=>{
-      const exists=(remote[m]?.[k]||[]).some(x=>x.id===it.id);
-      if(!exists) localItems.push({type:'add',kind:k,month:m,item:it});
+    // 1) puxa o consolidado do servidor
+    const sv=await api('/data','GET');
+    absorbTombstones(sv);
+    const remote=sv.months||{};
+    // 2) sobe lançamentos locais que ainda não estão no servidor
+    const localOps=[];
+    Object.keys(data).forEach(m=>{['income','expense'].forEach(k=>{(data[m]&&data[m][k]||[]).forEach(it=>{
+      const exists=(remote[m]&&remote[m][k]||[]).some(x=>x.id===it.id);
+      if(!exists && !tombstones[it.id]) localOps.push({type:'add',kind:k,month:m,item:it});
     });});});
-    for(const op of localItems){const s=await api('/op','POST',op);data=s.months||{};}
-    const finalServer=await api('/data','GET');
-    data=finalServer.months||{};
+    let last=sv;
+    for(const op of localOps){ last=await api('/op','POST',op); }
+    // 3) une tudo
+    data=mergeMonths(data,last.months||{});
     store.set(SYNC_CFG,JSON.stringify({url,token}));
-    cacheLocal();renderAll();setSyncUI('on');
+    pruneTombstones(); cacheLocal();renderAll();setSyncUI('on');
     hint.className='synchint ok';hint.textContent='✓ Conectado. Use a mesma senha no outro celular.';
     setTimeout(closeSyncSheet,1200);
   }catch(e){
@@ -631,8 +656,8 @@ document.getElementById('syncConnect').onclick=async()=>{
   }
 };
 document.getElementById('syncDisconnect').onclick=()=>{
-  sync={url:'',token:'',on:false};queue=[];
-  store.del(SYNC_CFG);store.del(QUEUE_KEY);
+  sync={url:'',token:'',on:false};queue=[];tombstones={};
+  store.del(SYNC_CFG);store.del(QUEUE_KEY);store.del(TOMB_KEY);
   setSyncUI('local');closeSyncSheet();
   toast('Sincronização desligada');
 };
